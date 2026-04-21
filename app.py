@@ -50,58 +50,75 @@ if "messages" not in st.session_state:
 st.title("🏠 TheHouseKraft Expert")
 st.caption("Ask questions or upload photos of your space for AI analysis.")
 
-# Sidebar for Image Upload
-with st.sidebar:
-    st.header("Visual Context")
-    uploaded_file = st.file_uploader("Upload space photo", type=["jpg", "png", "jpeg"])
-    if uploaded_file:
-        st.image(uploaded_file, caption="Target Space", use_container_width=True)
+
 
 # History
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
+        if "image" in message:
+            st.image(message["image"], use_container_width=True)
         st.markdown(message["content"])
 
 # --- CHAT ENGINE ---
-if prompt := st.chat_input("How can TheHouseKraft help you today?"):
+if prompt := st.chat_input("How can TheHouseKraft help you today?", accept_file=True, file_type=["jpg", "jpeg", "png"]):
     
-    st.session_state.messages.append({"role": "user", "content": prompt})
+    # 1. Extract data
+    user_text = str(prompt.text)
+    user_files = prompt.get("files", [])
+
+    # 2. Add to session state (We'll store the text, but display the image separately)
+    st.session_state.messages.append({"role": "user", "content": user_text})
+    
+    # 3. DISPLAY IN UI
     with st.chat_message("user"):
-        st.markdown(prompt)
+        # --- NEW: Image Preview Logic ---
+        if user_files:
+            for file in user_files:
+                st.image(file, use_container_width=True) # Shows the image above text
+        
+        st.markdown(user_text)
 
+    # 4. Assistant Response
     with st.chat_message("assistant"):
+        res_placeholder = st.empty()
+        full_res = ""
+        
         try:
-            #1. THE THINKING STATE
-            with st.status("TheHouseKraft Expert is thinking...", expanded=False) as status:
+            with st.status("Thinking about it....", expanded=False) as status:
                 model, vector_db = load_resources()
-
-                docs = vector_db.similarity_search(prompt, k=3)
+                docs = vector_db.similarity_search(user_text, k=3)
                 context = "\n".join([d.page_content for d in docs])
 
                 content_list = [
-                    f"{SYSTEM_PROMPT}\n\nKNOWLEDGE BASE:\n{context}\n\nUSER QUESTION: {prompt}"
-                ]
+                    f"{SYSTEM_PROMPT}\n\nKNOWLEDGE BASE:\n{context}\n\nUSER QUESTION: {user_text}"
+                ]               
 
-                if uploaded_file:
-                    img_data = Image.open(uploaded_file)
+                if user_files:
+                    # Open the image for the AI to see
+                    img_data = Image.open(user_files[0])
                     content_list.append(img_data)
 
-                status.update(label="Found the answer!", state="complete", expanded=False)
+                status.update(label="I got it! One moment...", state="complete", expanded=False)
             
-            #2. THE TYPING STATE
-            res_placeholder = st.empty()
-            full_res = ""
+            # Memory and Chat
+            history = []
+            for m in st.session_state.messages[-11:-1]:
+                role = "model" if m["role"] == "assistant" else "user"
+                history.append({"role": role, "parts": [str(m["content"])]})
 
-            
-            response = model.generate_content(content_list, stream=True)
+            chat = model.start_chat(history=history)
+            response = chat.send_message(content_list, stream=True)
+
             for chunk in response:
-                full_res += chunk.text
-                res_placeholder.markdown(full_res + "▌")
-            res_placeholder.markdown(full_res)
+                if chunk.text:
+                    full_res += chunk.text
+                    res_placeholder.markdown(full_res + "▌")
             
+            res_placeholder.markdown(full_res)
             st.session_state.messages.append({"role": "assistant", "content": full_res})
 
         except Exception as e:
-            st.error(f"Error: {e}. If it's a 429, just wait 10 seconds and try again!")
+            res_placeholder.error(f"Error: {e}")
+            st.stop()
 
     st.rerun()
