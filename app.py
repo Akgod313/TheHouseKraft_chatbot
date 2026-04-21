@@ -2,13 +2,120 @@ import streamlit as st
 import os
 import google.generativeai as genai
 from PIL import Image
+import psycopg2
 from dotenv import load_dotenv
+import requests
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_community.vectorstores import FAISS
 
+# --- 1. INITIALIZE CLERK ---
+# Securely fetch the key from Streamlit Secrets
+clerk_key = None
+if "CLERK_SECRET_KEY" in st.secrets:
+    clerk_key = st.secrets["CLERK_SECRET_KEY"]
+else:
+    # Fallback to .env for local testing
+    from dotenv import load_dotenv
+    load_dotenv()
+    clerk_key = os.getenv("CLERK_SECRET_KEY")
+
+# Stop the app if the key is still missing
+if not clerk_key:
+    st.error("🔑 CLERK_SECRET_KEY not found in Secrets or .env file!")
+    st.stop()
+    
+CLERK_KEY = st.secrets["CLERK_SECRET_KEY"]
+
+headers = {
+    'Authorization': f'Bearer {CLERK_KEY}',
+    'Content-Type': 'application/json'
+}
+
+# --- 2. AUTHENTICATION LOGIC ---
+if "user" not in st.session_state:
+    # Main Landing Page Branding
+    st.image("https://img.icons8.com/clouds/200/home.png", width=100)
+    st.title("HouseKraft Expert")
+    st.markdown("---")
+    
+    # Sidebar for Login/Signup
+    with st.sidebar:
+        st.header("🔐 Member Access")
+        auth_mode = st.tabs(["Login", "Create Account"])
+
+    # LOGIN TAB
+    with auth_mode[0]:
+        login_email = st.text_input("Email Address", key="login_email")
+        if st.button("Login to Dashboard", use_container_width=True):
+            res = requests.get('https://api.clerk.com/v1/users', headers=headers)
+            users = res.json()
+            found_user = next((u for u in users if any(e['email_address'] == login_email for e in u['email_addresses'])), None)
+            
+            if found_user:
+                st.session_state["user"] = {"id": found_user['id'], "name": found_user.get('first_name', 'User')}
+                st.success("Authenticated!")
+                st.rerun()
+            else:
+                st.error("Account not found. Please sign up.")
+
+    # SIGN UP TAB
+    with auth_mode[1]:
+        st.caption("Join HouseKraft to save your design history.")
+        new_email = st.text_input("Email", key="reg_email")
+        first_name = st.text_input("First Name", key="reg_name")
+        password = st.text_input("Password", type="password", key="reg_pass")
+        
+        if st.button("Register Account", use_container_width=True):
+            if not new_email or not password or not first_name:
+                st.warning("All fields are required.")
+            else:
+                # FIXED PAYLOAD: Using the structure Clerk expects
+                payload = {
+                    "email_address": [new_email],
+                    "password": password,
+                    "first_name": first_name,
+                    "skip_password_requirement": True,
+                    "skip_password_checks": True
+                }
+                
+                res = requests.post('https://api.clerk.com/v1/users', headers=headers, json=payload)
+                
+                if res.status_code == 200:
+                    user_data = res.json()
+                    st.session_state["user"] = {"id": user_data['id'], "name": first_name}
+                    st.balloons()
+                    st.success("Welcome to HouseKraft!")
+                    st.rerun()
+                else:
+                    error_detail = res.json()
+                    st.error(f"Error: {error_detail.get('errors', [{}])[0].get('message', 'Check Clerk Settings')}")
+    
+    st.stop() # Stops the rest of the app until logged in
+
+# --- 3. DEFINE USER VARIABLES (Only reaches here if logged in) ---
+user = st.session_state["user"]
+user_id = st.session_state["user"]["id"]
+user_name = user["first_name"]
+
+# --- 4. SIDEBAR UI ---
+with st.sidebar:
+    st.success(f"✅ Connected: {user_name}")
+    if st.button("Sign Out"):
+        del st.session_state["user"]
+        st.rerun()
+
+
 # --- SETUP ---
-load_dotenv()
-API_KEY = os.getenv("GEMINI_API_KEY")
+if "GEMINI_API_KEY" in st.secrets:
+    # Use this for Streamlit Cloud
+    API_KEY = st.secrets["GEMINI_API_KEY"]
+else:
+    # Use this for local testing
+    from dotenv import load_dotenv
+    load_dotenv()
+    API_KEY = os.getenv("GEMINI_API_KEY")
+
+genai.configure(api_key=API_KEY)
 
 st.set_page_config(page_title="TheHouseKraft Multimodal AI", layout="centered")
 
@@ -58,6 +165,15 @@ for message in st.session_state.messages:
         if "image" in message:
             st.image(message["image"], use_container_width=True)
         st.markdown(message["content"])
+
+
+with st.sidebar:
+    st.image("your_logo_path_or_url") # If you have a logo
+    st.title("HouseKraft Support")
+    st.info("This AI expert is trained on HouseKraft's internal design and repair manuals.")
+    if st.button("Clear Chat History"):
+        st.session_state.messages = []
+        st.rerun()
 
 # --- CHAT ENGINE ---
 if prompt := st.chat_input("How can TheHouseKraft help you today?", accept_file=True, file_type=["jpg", "jpeg", "png"]):

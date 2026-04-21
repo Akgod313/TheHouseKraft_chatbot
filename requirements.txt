@@ -1,7 +1,8 @@
 streamlit
 google-generativeai
 langchain-google-genai
-langchain-community
 faiss-cpu
+pillow
 python-dotenv
-Pillow
+psycopg2-binary
+requests
