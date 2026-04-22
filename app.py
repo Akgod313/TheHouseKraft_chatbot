@@ -1,240 +1,233 @@
 import streamlit as st
+
+st.set_page_config(page_title="TheHouseKraft Multimodal AI", layout="centered")
+
 import os
+import threading
 import google.generativeai as genai
 from PIL import Image
 import psycopg2
+from psycopg2.pool import ThreadedConnectionPool
+from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
-import requests
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_community.vectorstores import FAISS
 
-# --- 1. INITIALIZE CLERK ---
-# Securely fetch the key from Streamlit Secrets
-clerk_key = None
-if "CLERK_SECRET_KEY" in st.secrets:
-    clerk_key = st.secrets["CLERK_SECRET_KEY"]
-else:
-    # Fallback to .env for local testing
-    from dotenv import load_dotenv
-    load_dotenv()
-    clerk_key = os.getenv("CLERK_SECRET_KEY")
+# ─── REACT HANDSHAKE ───────────────────────────────────────────────────────────
+query_params = st.query_params
+if "user_id" in query_params:
+    st.session_state["user_id"] = query_params["user_id"]
+    st.session_state["user_name"] = query_params.get("name", "Homeowner")
+    st.query_params.clear()
 
-# Stop the app if the key is still missing
-if not clerk_key:
-    st.error("🔑 CLERK_SECRET_KEY not found in Secrets or .env file!")
+# ─── BOUNCER ───────────────────────────────────────────────────────────────────
+if "user_id" not in st.session_state:
+    st.warning("🚨 Access Denied. Please log in via the HouseKraft Portal.")
+    st.info("Direct your browser to your React site (e.g., http://localhost:5173)")
     st.stop()
-    
-CLERK_KEY = st.secrets["CLERK_SECRET_KEY"]
 
-headers = {
-    'Authorization': f'Bearer {CLERK_KEY}',
-    'Content-Type': 'application/json'
-}
+user_id   = st.session_state["user_id"]
+user_name = st.session_state["user_name"]
 
-# --- 2. AUTHENTICATION LOGIC ---
-if "user" not in st.session_state:
-    # Main Landing Page Branding
-    st.image("https://img.icons8.com/clouds/200/home.png", width=100)
-    st.title("HouseKraft Expert")
-    st.markdown("---")
-    
-    # Sidebar for Login/Signup
-    with st.sidebar:
-        st.header("🔐 Member Access")
-        auth_mode = st.tabs(["Login", "Create Account"])
-
-    # LOGIN TAB
-    with auth_mode[0]:
-        login_email = st.text_input("Email Address", key="login_email")
-        if st.button("Login to Dashboard", use_container_width=True):
-            res = requests.get('https://api.clerk.com/v1/users', headers=headers)
-            users = res.json()
-            found_user = next((u for u in users if any(e['email_address'] == login_email for e in u['email_addresses'])), None)
-            
-            if found_user:
-                st.session_state["user"] = {"id": found_user['id'], "name": found_user.get('first_name', 'User')}
-                st.success("Authenticated!")
-                st.rerun()
-            else:
-                st.error("Account not found. Please sign up.")
-
-    # SIGN UP TAB
-    with auth_mode[1]:
-        st.caption("Join HouseKraft to save your design history.")
-        new_email = st.text_input("Email", key="reg_email")
-        first_name = st.text_input("First Name", key="reg_name")
-        password = st.text_input("Password", type="password", key="reg_pass")
-        
-        if st.button("Register Account", use_container_width=True):
-            if not new_email or not password or not first_name:
-                st.warning("All fields are required.")
-            else:
-                # FIXED PAYLOAD: Using the structure Clerk expects
-                payload = {
-                    "email_address": [new_email],
-                    "password": password,
-                    "first_name": first_name,
-                    "skip_password_requirement": True,
-                    "skip_password_checks": True
-                }
-                
-                res = requests.post('https://api.clerk.com/v1/users', headers=headers, json=payload)
-                
-                if res.status_code == 200:
-                    user_data = res.json()
-                    st.session_state["user"] = {"id": user_data['id'], "name": first_name}
-                    st.balloons()
-                    st.success("Welcome to HouseKraft!")
-                    st.rerun()
-                else:
-                    error_detail = res.json()
-                    st.error(f"Error: {error_detail.get('errors', [{}])[0].get('message', 'Check Clerk Settings')}")
-    
-    st.stop() # Stops the rest of the app until logged in
-
-# --- 3. DEFINE USER VARIABLES (Only reaches here if logged in) ---
-user = st.session_state["user"]
-user_id = st.session_state["user"]["id"]
-user_name = user["first_name"]
-
-# --- 4. SIDEBAR UI ---
-with st.sidebar:
-    st.success(f"✅ Connected: {user_name}")
-    if st.button("Sign Out"):
-        del st.session_state["user"]
-        st.rerun()
-
-
-# --- SETUP ---
+# ─── API KEY ───────────────────────────────────────────────────────────────────
 if "GEMINI_API_KEY" in st.secrets:
-    # Use this for Streamlit Cloud
     API_KEY = st.secrets["GEMINI_API_KEY"]
 else:
-    # Use this for local testing
-    from dotenv import load_dotenv
     load_dotenv()
     API_KEY = os.getenv("GEMINI_API_KEY")
 
 genai.configure(api_key=API_KEY)
 
-st.set_page_config(page_title="TheHouseKraft Multimodal AI", layout="centered")
-
-# --- PROMPT ---
+# ─── SYSTEM PROMPT ─────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """
-You are the HouseKraft AI Expert. 
-You can see images provided by the user. 
-Always combine the INTERNAL KNOWLEDGE (RAG) with what you see in the IMAGE 
+You are the HouseKraft AI Expert.
+You can see images provided by the user.
+Always combine the INTERNAL KNOWLEDGE (RAG) with what you see in the IMAGE
 to give design, repair, or product advice.
 Do not mention anything about RAG to the user, make it sound like you already know all of this.
 """
 
-# --- CACHED RESOURCES ---
+# ─── SPEED FIX 1: CONNECTION POOL ──────────────────────────────────────────────
+# Instead of opening a fresh TCP connection to Neon on every message (slow!),
+# we keep a pool of 2-5 reusable connections alive for the lifetime of the server.
+@st.cache_resource
+def get_pool():
+    return ThreadedConnectionPool(
+        minconn=2,
+        maxconn=5,
+        dsn=st.secrets["DATABASE_URL"]
+    )
+
+def get_conn():
+    return get_pool().getconn()
+
+def release_conn(conn):
+    get_pool().putconn(conn)
+
+# ─── SPEED FIX 2: CACHE MODEL + VECTOR DB ──────────────────────────────────────
 @st.cache_resource
 def load_resources():
     genai.configure(api_key=API_KEY)
-    # Gemini 3 Flash is the best for multimodal reasoning
-    model = genai.GenerativeModel('gemini-3-flash-preview')
-    
+    model = genai.GenerativeModel('gemini-2.5-flash-lite')
     embeddings = GoogleGenerativeAIEmbeddings(
-        model="models/gemini-embedding-2-preview", 
+        model="models/gemini-embedding-2-preview",
         google_api_key=API_KEY,
         task_type="retrieval_query"
     )
-    
-    # Load the local index built by engine.py
     vector_db = FAISS.load_local(
-        "faiss_index", 
-        embeddings, 
+        "faiss_index",
+        embeddings,
         allow_dangerous_deserialization=True
     )
     return model, vector_db
 
-# --- SESSION ---
+# ─── SPEED FIX 3: PRE-WARM ON PAGE LOAD ───────────────────────────────────────
+# Kick off resource loading the moment the page opens, in a background thread.
+# By the time the user types their first message, model + FAISS are already cached.
+if "resources_warmed" not in st.session_state:
+    st.session_state["resources_warmed"] = True
+    threading.Thread(target=load_resources, daemon=True).start()
+
+# ─── SPEED FIX 4: CACHE RAG RESULTS PER QUERY ──────────────────────────────────
+# Identical or similar queries skip the embedding + FAISS round trip entirely.
+@st.cache_data(ttl=3600, max_entries=100)
+def cached_rag_search(query: str) -> str:
+    _, vector_db = load_resources()
+    docs = vector_db.similarity_search(query, k=3)
+    return "\n".join([d.page_content for d in docs])
+
+# ─── DB INIT ───────────────────────────────────────────────────────────────────
+def init_db():
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS housekraft_chats (
+                id         SERIAL PRIMARY KEY,
+                clerk_id   TEXT      NOT NULL,
+                role       TEXT      NOT NULL,
+                content    TEXT      NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        conn.commit()
+        cur.close()
+    finally:
+        release_conn(conn)
+
+init_db()
+
+# ─── LOAD HISTORY ONCE INTO SESSION STATE ──────────────────────────────────────
 if "messages" not in st.session_state:
-    st.session_state.messages = []
+    conn = get_conn()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute(
+            "SELECT role, content FROM housekraft_chats WHERE clerk_id = %s ORDER BY created_at ASC",
+            (user_id,)
+        )
+        st.session_state.messages = [dict(r) for r in cur.fetchall()]
+        cur.close()
+    finally:
+        release_conn(conn)
 
-# --- UI ---
+# ─── UI ────────────────────────────────────────────────────────────────────────
 st.title("🏠 TheHouseKraft Expert")
-st.caption("Ask questions or upload photos of your space for AI analysis.")
-
-
-
-# History
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        if "image" in message:
-            st.image(message["image"], use_container_width=True)
-        st.markdown(message["content"])
-
 
 with st.sidebar:
-    st.image("your_logo_path_or_url") # If you have a logo
+    st.image("https://img.icons8.com/clouds/200/home.png", width=100)
     st.title("HouseKraft Support")
-    st.info("This AI expert is trained on HouseKraft's internal design and repair manuals.")
+    st.write(f"Welcome, **{user_name}**!")
     if st.button("Clear Chat History"):
         st.session_state.messages = []
         st.rerun()
 
-# --- CHAT ENGINE ---
-if prompt := st.chat_input("How can TheHouseKraft help you today?", accept_file=True, file_type=["jpg", "jpeg", "png"]):
-    
-    # 1. Extract data
-    user_text = str(prompt.text)
-    user_files = prompt.get("files", [])
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
 
-    # 2. Add to session state (We'll store the text, but display the image separately)
+# ─── CHAT ENGINE ───────────────────────────────────────────────────────────────
+prompt_obj = st.chat_input(
+    "How can TheHouseKraft help you today?",
+    accept_file=True,
+    file_type=["jpg", "jpeg", "png"]
+)
+
+if prompt_obj:
+    user_text  = str(prompt_obj.text)
+    user_files = prompt_obj.get("files", [])
+
+    # Show user bubble immediately — no waiting
     st.session_state.messages.append({"role": "user", "content": user_text})
-    
-    # 3. DISPLAY IN UI
     with st.chat_message("user"):
-        # --- NEW: Image Preview Logic ---
         if user_files:
-            for file in user_files:
-                st.image(file, use_container_width=True) # Shows the image above text
-        
+            for f in user_files:
+                st.image(f, use_container_width=True)
         st.markdown(user_text)
 
-    # 4. Assistant Response
+    # Assistant response
     with st.chat_message("assistant"):
         res_placeholder = st.empty()
         full_res = ""
-        
+
         try:
-            with st.status("Thinking about it....", expanded=False) as status:
-                model, vector_db = load_resources()
-                docs = vector_db.similarity_search(user_text, k=3)
-                context = "\n".join([d.page_content for d in docs])
+            with st.spinner("Thinking about it...."):
+                # Model is instant — already cached from pre-warm
+                model, _ = load_resources()
+
+                # RAG is cached — skips embedding call on repeated/similar queries
+                context = cached_rag_search(user_text)
 
                 content_list = [
                     f"{SYSTEM_PROMPT}\n\nKNOWLEDGE BASE:\n{context}\n\nUSER QUESTION: {user_text}"
-                ]               
+                ]
 
                 if user_files:
-                    # Open the image for the AI to see
-                    img_data = Image.open(user_files[0])
-                    content_list.append(img_data)
+                    content_list.append(Image.open(user_files[0]))
 
-                status.update(label="I got it! One moment...", state="complete", expanded=False)
-            
-            # Memory and Chat
-            history = []
-            for m in st.session_state.messages[-11:-1]:
-                role = "model" if m["role"] == "assistant" else "user"
-                history.append({"role": role, "parts": [str(m["content"])]})
+                # Build conversation history from session state (no DB read)
+                history = []
+                for m in st.session_state.messages[-11:-1]:
+                    role = "model" if m["role"] == "assistant" else "user"
+                    history.append({"role": role, "parts": [str(m["content"])]})
 
-            chat = model.start_chat(history=history)
-            response = chat.send_message(content_list, stream=True)
+                chat     = model.start_chat(history=history)
+                # Initiate the streaming request while spinner is still showing
+                response = chat.send_message(content_list, stream=True)
 
+            # Spinner gone — stream tokens directly into the UI
             for chunk in response:
                 if chunk.text:
                     full_res += chunk.text
                     res_placeholder.markdown(full_res + "▌")
-            
+
             res_placeholder.markdown(full_res)
             st.session_state.messages.append({"role": "assistant", "content": full_res})
 
+            # ─── SPEED FIX 5: NON-BLOCKING BACKGROUND DB WRITE ────────────────
+            # Both messages are saved together after streaming is done.
+            # The UI never waits on Neon — zero flicker, zero delay.
+            def save_to_db(uid, u_text, a_text):
+                conn = get_conn()
+                try:
+                    cur = conn.cursor()
+                    cur.execute(
+                        """INSERT INTO housekraft_chats (clerk_id, role, content)
+                           VALUES (%s, %s, %s), (%s, %s, %s)""",
+                        (uid, "user", u_text, uid, "assistant", a_text)
+                    )
+                    conn.commit()
+                    cur.close()
+                except Exception as db_err:
+                    print(f"[DB save error] {db_err}")
+                finally:
+                    release_conn(conn)
+
+            threading.Thread(
+                target=save_to_db,
+                args=(user_id, user_text, full_res),
+                daemon=True
+            ).start()
+
         except Exception as e:
             res_placeholder.error(f"Error: {e}")
-            st.stop()
-
-    st.rerun()
