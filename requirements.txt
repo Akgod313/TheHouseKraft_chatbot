@@ -6,3 +6,6 @@ pillow
 python-dotenv
 psycopg2-binary
 requests
+fastapi
+uvicorn
+gunicorn

@@ -115,7 +115,7 @@ app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:5174"],  # add your prod URL here when deploying
+    allow_origins=["http://localhost:5173", "http://localhost:5174", "https://the-house-kraft-chatbot-web.vercel.app/"],  # add your prod URL here when deploying
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
