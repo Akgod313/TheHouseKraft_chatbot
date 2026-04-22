@@ -3,6 +3,7 @@ import threading
 from contextlib import asynccontextmanager
 
 from google import genai
+from google.genai import types
 from PIL import Image
 import psycopg2
 from psycopg2.pool import ThreadedConnectionPool
@@ -11,12 +12,12 @@ from dotenv import load_dotenv
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_community.vectorstores import FAISS
 
-from fastapi import FastAPI, Header, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, Header, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
 import io
 import json
+import traceback
 from typing import Optional
 from functools import lru_cache
 
@@ -25,8 +26,6 @@ load_dotenv()
 
 API_KEY      = os.getenv("GEMINI_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
-
-genai.configure(api_key=API_KEY)
 
 SYSTEM_PROMPT = """
 You are the HouseKraft AI Expert.
@@ -52,16 +51,15 @@ def release_conn(conn):
     get_pool().putconn(conn)
 
 # ─── AI RESOURCES ──────────────────────────────────────────────────────────────
-_model      = None
-_vector_db  = None
-_lock       = threading.Lock()
+_client    = None
+_vector_db = None
+_lock      = threading.Lock()
 
 def load_resources():
-    global _model, _vector_db
+    global _client, _vector_db
     with _lock:
-        if _model is None:
-            genai.configure(api_key=API_KEY)
-            _model = genai.GenerativeModel('gemini-2.5-flash-lite')
+        if _client is None:
+            _client = genai.Client(api_key=API_KEY)
             embeddings = GoogleGenerativeAIEmbeddings(
                 model="models/gemini-embedding-2-preview",
                 google_api_key=API_KEY,
@@ -72,12 +70,14 @@ def load_resources():
                 embeddings,
                 allow_dangerous_deserialization=True
             )
-    return _model, _vector_db
+    return _client, _vector_db
 
 # ─── RAG CACHE ─────────────────────────────────────────────────────────────────
 @lru_cache(maxsize=100)
 def cached_rag_search(query: str) -> str:
-    _, vector_db = load_resources()
+    _, vector_db = load_resources()  # this already handles it
+    if vector_db is None:
+        return "No knowledge base available."
     docs = vector_db.similarity_search(query, k=3)
     return "\n".join([d.page_content for d in docs])
 
@@ -100,10 +100,9 @@ def init_db():
     finally:
         release_conn(conn)
 
-# ─── LIFESPAN (startup/shutdown) ───────────────────────────────────────────────
+# ─── LIFESPAN ──────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Pre-warm everything on server start
     init_db()
     threading.Thread(target=load_resources, daemon=True).start()
     yield
@@ -115,7 +114,11 @@ app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:5174", "https://the-house-kraft-chatbot-web.vercel.app/"],  # add your prod URL here when deploying
+    allow_origins=[
+        "http://localhost:5173",
+        "http://localhost:5174",
+        "https://the-house-kraft-chatbot-web.vercel.app",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -154,66 +157,83 @@ def clear_history(x_user_id: str = Header(...)):
 
 @app.post("/chat")
 async def chat(
-    message: str       = Form(...),
-    history: str       = Form(...),   # JSON string of [{role, content}]
-    image:   Optional[UploadFile] = File(None),
-    x_user_id: str     = Header(...),
+    message:   str                  = Form(...),
+    history:   str                  = Form(...),
+    image:     Optional[UploadFile] = File(None),
+    x_user_id: str                  = Header(...),
 ):
-    """
-    Streams the assistant response token by token as plain text chunks.
-    The client reads via ReadableStream / EventSource.
-    """
-
     async def stream_response():
-        model, _ = load_resources()
-        context  = cached_rag_search(message)
+        try:
+            client, _ = load_resources()
+            context   = cached_rag_search(message)
 
-        content_list = [
-            f"{SYSTEM_PROMPT}\n\nKNOWLEDGE BASE:\n{context}\n\nUSER QUESTION: {message}"
-        ]
+            # Build prompt text
+            prompt_text = f"{SYSTEM_PROMPT}\n\nKNOWLEDGE BASE:\n{context}\n\nUSER QUESTION: {message}"
 
-        if image:
-            img_bytes = await image.read()
-            img_data  = Image.open(io.BytesIO(img_bytes))
-            content_list.append(img_data)
+            # Handle optional image
+            img_bytes = None
+            if image:
+                img_bytes = await image.read()
 
-        # Rebuild Gemini history from JSON
-        raw_history = json.loads(history)
-        gemini_history = []
-        for m in raw_history[-10:]:
-            role = "model" if m["role"] == "assistant" else "user"
-            gemini_history.append({"role": role, "parts": [m["content"]]})
-
-        chat_session = model.start_chat(history=gemini_history)
-        response     = chat_session.send_message(content_list, stream=True)
-
-        full_res = ""
-        for chunk in response:
-            if chunk.text:
-                full_res += chunk.text
-                yield chunk.text
-
-        # Save both messages to DB in background after streaming finishes
-        def save(uid, user_msg, assistant_msg):
-            conn = get_conn()
-            try:
-                cur = conn.cursor()
-                cur.execute(
-                    """INSERT INTO housekraft_chats (clerk_id, role, content)
-                       VALUES (%s, %s, %s), (%s, %s, %s)""",
-                    (uid, "user", user_msg, uid, "assistant", assistant_msg)
+            # Rebuild history for the new API
+            raw_history = json.loads(history)
+            gemini_history = []
+            for m in raw_history[-10:]:
+                role = "model" if m["role"] == "assistant" else "user"
+                gemini_history.append(
+                    types.Content(role=role, parts=[types.Part(text=m["content"])])
                 )
-                conn.commit()
-                cur.close()
-            except Exception as e:
-                print(f"[DB save error] {e}")
-            finally:
-                release_conn(conn)
 
-        threading.Thread(
-            target=save,
-            args=(x_user_id, message, full_res),
-            daemon=True
-        ).start()
+            # Build current user turn parts
+            user_parts = [types.Part(text=prompt_text)]
+            if img_bytes:
+                user_parts.append(
+                    types.Part(
+                        inline_data=types.Blob(mime_type="image/jpeg", data=img_bytes)
+                    )
+                )
+
+            contents = gemini_history + [
+                types.Content(role="user", parts=user_parts)
+            ]
+
+            # Stream response
+            full_res = ""
+            response = client.models.generate_content_stream(
+                model="gemini-2.5-flash",
+                contents=contents,
+            )
+
+            for chunk in response:
+                if chunk.text:
+                    full_res += chunk.text
+                    yield chunk.text
+
+            # Save to DB in background
+            def save(uid, user_msg, assistant_msg):
+                conn = get_conn()
+                try:
+                    cur = conn.cursor()
+                    cur.execute(
+                        """INSERT INTO housekraft_chats (clerk_id, role, content)
+                           VALUES (%s, %s, %s), (%s, %s, %s)""",
+                        (uid, "user", user_msg, uid, "assistant", assistant_msg)
+                    )
+                    conn.commit()
+                    cur.close()
+                except Exception as e:
+                    print(f"[DB save error] {e}")
+                finally:
+                    release_conn(conn)
+
+            threading.Thread(
+                target=save,
+                args=(x_user_id, message, full_res),
+                daemon=True
+            ).start()
+
+        except Exception as e:
+            traceback.print_exc()
+            yield f"ERROR: {e}"
 
     return StreamingResponse(stream_response(), media_type="text/plain")
