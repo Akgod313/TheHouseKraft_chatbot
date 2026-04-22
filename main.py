@@ -153,17 +153,39 @@ async def lifespan(app: FastAPI):
 # ─── APP ───────────────────────────────────────────────────────────────────────
 app = FastAPI(lifespan=lifespan)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://localhost:5174",
-        "https://the-house-kraft-chatbot-web.vercel.app",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+from fastapi.middleware.cors import CORSMiddleware
+
+# Dynamic CORS — validates origin against a regex so ALL Vercel preview
+# deployments work without hardcoding each URL.
+import re
+CORS_PATTERN = re.compile(
+    r"(^https://the-house-kraft-chatbot[^.]*\.vercel\.app$)"
+    r"|(^http://localhost:\d+$)"
 )
+
+@app.middleware("http")
+async def cors_middleware(request, call_next):
+    origin = request.headers.get("origin", "")
+    is_allowed = bool(CORS_PATTERN.match(origin))
+
+    # Handle preflight
+    if request.method == "OPTIONS":
+        from starlette.responses import Response
+        headers = {
+            "Access-Control-Allow-Origin": origin if is_allowed else "",
+            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+            "Vary": "Origin",
+        }
+        return Response(status_code=204, headers=headers)
+
+    response = await call_next(request)
+    if is_allowed:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Vary"] = "Origin"
+    return response
 
 # ─── HELPER: Get or create user profile ────────────────────────────────────────
 def get_profile(clerk_id: str) -> dict:
