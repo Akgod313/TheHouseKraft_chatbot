@@ -1,6 +1,8 @@
 streamlit
 google-genai
+langchain
 langchain-google-genai
+langchain-community
 faiss-cpu
 pillow
 python-dotenv
@@ -9,3 +11,4 @@ requests
 fastapi
 uvicorn
 gunicorn
+python-multipart
