@@ -21,6 +21,10 @@ import traceback
 from typing import Optional
 from functools import lru_cache
 
+import sys
+print("Python version:", sys.version)
+print("Starting app...", flush=True)
+
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
 load_dotenv()
 
@@ -103,8 +107,17 @@ def init_db():
 # ─── LIFESPAN ──────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_db()
-    threading.Thread(target=load_resources, daemon=True).start()
+    try:
+        print("Initializing DB...", flush=True)
+        init_db()
+        print("Loading resources...", flush=True)
+        load_resources()
+        print("All resources loaded successfully!", flush=True)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"STARTUP ERROR: {e}", flush=True)
+        raise
     yield
     if _pool:
         _pool.closeall()
