@@ -2,7 +2,7 @@ import os
 import threading
 from contextlib import asynccontextmanager
 
-import google.generativeai as genai
+from google import genai
 from PIL import Image
 import psycopg2
 from psycopg2.pool import ThreadedConnectionPool

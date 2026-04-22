@@ -1,5 +1,5 @@
 streamlit
-google-generativeai
+google-genai
 langchain-google-genai
 faiss-cpu
 pillow
