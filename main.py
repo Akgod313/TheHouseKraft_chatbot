@@ -8,10 +8,12 @@ from typing import Optional
 import io
 import json
 import uuid
+import base64
 
 from google import genai
 from google.genai import types
 from PIL import Image
+import psycopg
 import psycopg2
 from psycopg2.pool import ThreadedConnectionPool
 from psycopg2.extras import RealDictCursor
@@ -50,14 +52,54 @@ _pool: ThreadedConnectionPool = None
 def get_pool() -> ThreadedConnectionPool:
     global _pool
     if _pool is None:
-        _pool = ThreadedConnectionPool(minconn=2, maxconn=10, dsn=DATABASE_URL)
+        _pool = ThreadedConnectionPool(minconn=1, maxconn=10, dsn=DATABASE_URL)
+    return _pool
+
+def reset_pool() -> ThreadedConnectionPool:
+    global _pool
+    if _pool is not None:
+        try:
+            _pool.closeall()
+        except Exception:
+            pass
+    _pool = ThreadedConnectionPool(minconn=1, maxconn=10, dsn=DATABASE_URL)
     return _pool
 
 def get_conn():
-    return get_pool().getconn()
+    pool = get_pool()
+    conn = None
+    try:
+        conn = pool.getconn()
+        if conn.closed:
+            raise psycopg2.OperationalError("Connection from pool is closed")
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        return conn
+    except (psycopg2.OperationalError, psycopg2.InterfaceError):
+        if conn is not None:
+            try:
+                pool.putconn(conn, close=True)
+            except Exception:
+                pass
+        pool = reset_pool()
+        conn = pool.getconn()
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        return conn
 
 def release_conn(conn):
-    get_pool().putconn(conn)
+    if conn is None:
+        return
+    try:
+        if conn.closed:
+            get_pool().putconn(conn, close=True)
+        else:
+            get_pool().putconn(conn)
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 # ─── AI RESOURCES ──────────────────────────────────────────────────────────────
 _client    = None
@@ -115,8 +157,24 @@ def init_db():
                 clerk_id     TEXT      NOT NULL,
                 role         TEXT      NOT NULL,
                 content      TEXT      NOT NULL,
+                image_data   TEXT,
                 created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+        """)
+
+        cur.execute("""
+            ALTER TABLE housekraft_chats
+            ADD COLUMN IF NOT EXISTS session_id TEXT;
+        """)
+
+        cur.execute("""
+            ALTER TABLE housekraft_chats
+            ADD COLUMN IF NOT EXISTS image_data TEXT;
+        """)
+
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_housekraft_chats_session_created_at
+            ON housekraft_chats(session_id, created_at);
         """)
 
         # User profile table — stores facts the AI learns about each user
@@ -222,6 +280,35 @@ def profile_to_text(profile: dict) -> str:
         lines.append(f"- {k}: {v}")
     return "\n".join(lines)
 
+# ─── CONNECTION TO DATABASE ───────────────────────────
+def add_user(name):
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                conn.execute(
+                    "INSERT INTO users (name) VALUES (%s) RETURNING id;",
+                    (name)
+                )
+
+                new_id = cur.fetchone()[0]
+                print(f"Success! Inserted user with ID: {new_id}")
+
+    except :
+        print(f"Error sending data to Neon: {new_id}")
+
+
+def append_messages(messages):
+    try:
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                for msg in messages:
+                    cur.execute(
+                        "INSERT INTO messages (session_id, role,content) VALUES (%s, %s, %s);",
+                        (msg["session_id"], msg["role"], msg["content"])
+                    )
+    except Exception as e:
+        print(f"Error sending data to Neon: {e}")
+
 # ─── HELPER: Extract profile facts from conversation ───────────────────────────
 def extract_profile_facts(client, existing_profile: dict, user_message: str, assistant_reply: str) -> dict:
     """Ask Gemini to extract any new personal facts from the exchange."""
@@ -275,6 +362,63 @@ Return ONLY the title, no quotes, no punctuation at the end.
         return "New Chat"
 
 # ─── ROUTES ────────────────────────────────────────────────────────────────────
+
+def normalize_history_items(items) -> list[dict]:
+    normalized = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role")
+        content = (item.get("content") or "").strip()
+        if role not in {"user", "assistant"} or not content:
+            continue
+        if role == "assistant" and content.startswith("ERROR:"):
+            continue
+        normalized.append({"role": role, "content": content})
+    return normalized
+
+
+def get_recent_session_messages(session_id: str, clerk_id: str, limit: int = 12) -> list[dict]:
+    conn = get_conn()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("""
+            SELECT role, content
+            FROM housekraft_chats
+            WHERE session_id = %s AND clerk_id = %s
+            ORDER BY created_at DESC
+            LIMIT %s
+        """, (session_id, clerk_id, limit))
+        rows = [dict(r) for r in cur.fetchall()]
+        cur.close()
+        return list(reversed(rows))
+    finally:
+        release_conn(conn)
+
+
+def save_chat_message(session_id: str, clerk_id: str, role: str, content: str, image_data: Optional[str] = None):
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO housekraft_chats (session_id, clerk_id, role, content, image_data)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (session_id, clerk_id, role, content, image_data))
+        cur.execute("""
+            UPDATE housekraft_sessions
+            SET updated_at = NOW()
+            WHERE session_id = %s AND clerk_id = %s
+        """, (session_id, clerk_id))
+        conn.commit()
+        cur.close()
+    except Exception as e:
+        conn.rollback()
+        traceback.print_exc()
+        print(f"[DB save error] session_id={session_id} user_id={clerk_id} role={role} error={e}", flush=True)
+        raise
+    finally:
+        release_conn(conn)
+
 
 # Get all sessions for a user
 @app.get("/sessions")
@@ -334,7 +478,7 @@ def get_history(session_id: str, x_user_id: str = Header(...)):
     try:
         cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute("""
-            SELECT role, content FROM housekraft_chats
+            SELECT role, content, image_data AS image FROM housekraft_chats
             WHERE session_id = %s AND clerk_id = %s
             ORDER BY created_at ASC
         """, (session_id, x_user_id))
@@ -360,12 +504,48 @@ async def chat(
     x_user_id:  str                  = Header(...),
 ):
     async def stream_response():
+        full_res = ""
+        user_message_saved = False
+        assistant_message_saved = False
         try:
             client, _ = load_resources()
-            context   = cached_rag_search(message)
-            profile   = get_profile(x_user_id)
+            context = cached_rag_search(message)
+            profile = get_profile(x_user_id)
 
-            # Build prompt
+            try:
+                raw_history = normalize_history_items(json.loads(history))
+            except Exception:
+                raw_history = []
+
+            db_history = get_recent_session_messages(session_id, x_user_id, limit=12)
+            conversation_history = db_history if db_history else raw_history
+            is_first = len(conversation_history) == 0
+
+            img_bytes = None
+            stored_image_data = None
+            image_mime_type = "image/jpeg"
+            if image:
+                img_bytes = await image.read()
+                image_mime_type = image.content_type or image_mime_type
+                stored_image_data = f"data:{image_mime_type};base64,{base64.b64encode(img_bytes).decode('utf-8')}"
+
+            save_chat_message(session_id, x_user_id, "user", message, stored_image_data)
+            user_message_saved = True
+
+            if is_first:
+                title = generate_session_title(client, message)
+                conn = get_conn()
+                try:
+                    cur = conn.cursor()
+                    cur.execute(
+                        "UPDATE housekraft_sessions SET title = %s WHERE session_id = %s AND clerk_id = %s",
+                        (title, session_id, x_user_id)
+                    )
+                    conn.commit()
+                    cur.close()
+                finally:
+                    release_conn(conn)
+
             prompt_text = f"""{SYSTEM_PROMPT}
 
 USER PROFILE (what you know about this user):
@@ -376,33 +556,23 @@ KNOWLEDGE BASE:
 
 USER MESSAGE: {message}"""
 
-            # Handle optional image
-            img_bytes = None
-            if image:
-                img_bytes = await image.read()
-
-            # Rebuild history
-            raw_history = json.loads(history)
             gemini_history = []
-            for m in raw_history[-10:]:
+            for m in conversation_history[-10:]:
                 role = "model" if m["role"] == "assistant" else "user"
                 gemini_history.append(
                     types.Content(role=role, parts=[types.Part(text=m["content"])])
                 )
 
-            # Build current user turn
             user_parts = [types.Part(text=prompt_text)]
             if img_bytes:
                 user_parts.append(
-                    types.Part(inline_data=types.Blob(mime_type="image/jpeg", data=img_bytes))
+                    types.Part(inline_data=types.Blob(mime_type=image_mime_type, data=img_bytes))
                 )
 
             contents = gemini_history + [
                 types.Content(role="user", parts=user_parts)
             ]
 
-            # Stream response
-            full_res = ""
             response = client.models.generate_content_stream(
                 model="gemini-2.5-flash",
                 contents=contents,
@@ -413,67 +583,22 @@ USER MESSAGE: {message}"""
                     full_res += chunk.text
                     yield chunk.text
 
-            # Post-stream: save messages, update profile, update session title
-            def post_save(uid, sid, user_msg, assistant_msg, existing_profile, is_first):
-                conn = get_conn()
-                try:
-                    cur = conn.cursor()
+            if full_res.strip():
+                save_chat_message(session_id, x_user_id, "assistant", full_res)
+                assistant_message_saved = True
 
-                    # Save messages
-                    cur.execute("""
-                        INSERT INTO housekraft_chats (session_id, clerk_id, role, content)
-                        VALUES (%s, %s, %s, %s), (%s, %s, %s, %s)
-                    """, (sid, uid, "user", user_msg, sid, uid, "assistant", assistant_msg))
-
-                    # Update session updated_at
-                    cur.execute("""
-                        UPDATE housekraft_sessions SET updated_at = NOW() WHERE session_id = %s
-                    """, (sid,))
-
-                    conn.commit()
-                    cur.close()
-                except Exception as e:
-                    print(f"[DB save error] {e}")
-                finally:
-                    release_conn(conn)
-
-                # Generate title for first message
-                if is_first:
-                    title = generate_session_title(client, user_msg)
-                    conn2 = get_conn()
-                    try:
-                        cur2 = conn2.cursor()
-                        cur2.execute(
-                            "UPDATE housekraft_sessions SET title = %s WHERE session_id = %s",
-                            (title, sid)
-                        )
-                        conn2.commit()
-                        cur2.close()
-                    finally:
-                        release_conn(conn2)
-
-                # Extract and save profile facts
-                new_profile = extract_profile_facts(client, existing_profile, user_msg, assistant_msg)
-                if new_profile != existing_profile:
-                    save_profile(uid, new_profile)
-
-            is_first = len(json.loads(history)) == 0
-
-            threading.Thread(
-                target=post_save,
-                args=(x_user_id, session_id, message, full_res, profile, is_first),
-                daemon=True
-            ).start()
+                new_profile = extract_profile_facts(client, profile, message, full_res)
+                if new_profile != profile:
+                    save_profile(x_user_id, new_profile)
 
         except Exception as e:
             traceback.print_exc()
-            yield f"ERROR: {e}"
+            error_message = f"ERROR: {e}"
+            if user_message_saved and not assistant_message_saved:
+                try:
+                    save_chat_message(session_id, x_user_id, "assistant", error_message)
+                except Exception:
+                    traceback.print_exc()
+            yield error_message
 
     return StreamingResponse(stream_response(), media_type="text/plain")
-
-
-@app.get("/models")
-def list_models():
-    client, _ = load_resources()
-    models = client.models.list()
-    return {"models": [m.name for m in models]}
